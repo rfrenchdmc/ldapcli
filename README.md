@@ -4,9 +4,11 @@ Manage LDAP users and groups via CLI
 
 ## Getting Started
 
-1. Install - `pip install ldapcli`
-2. Configure - `ldapcli profile add`
-3. Run - `ldapcli`
+1. Clone repo - `git clone git@github.com:rfrenchdmc/ldapcli.git`
+2. Change dir - `cd ldapcli`
+3. Install - `pip install .`
+4. Configure - `ldapcli profile add`
+5. Run - `ldapcli`
 
 - help - Information can be received using the `--help` or '-h' flag
 
