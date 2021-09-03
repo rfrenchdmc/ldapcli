@@ -46,6 +46,7 @@ _verbosity = 1
 
 LATEST_CONFIG_VERSION = '1.0'
 
+GROUP_SPACING='\n\t            '
 
 class LdapConfig:
 
@@ -130,13 +131,13 @@ def _normalize_names(nm, base):
     return name, dn
 
 
-def _print_entry(entry, attributes, show_empty=True):
+def _print_entry(entry, attributes, show_empty=True, separator=','):
     print(entry.entry_dn)
     for a in attributes:
         v = entry.entry_attributes_as_dict[a]
 
         if v or show_empty:
-            print(f"\t{a}: {','.join(v)}")
+            print(f"\t{a}: {separator.join(v)}")
 
 
 def set_verbosity(v):
@@ -412,6 +413,23 @@ def user_group_add(ctx, username, group):
 
     _remove_user_from_groups(config, connect, u_dn, group)
 
+@user_group.command(name='display')
+@click.option("--username", '-u', required=True, help="User to remove")
+@click.pass_context
+def user_group_display(ctx, username):
+    connect = ctx.obj['connect']
+    config = ctx.obj[CTX_CONFIG]
+
+    username, u_dn = _verify_user_exists(ctx, username)
+
+    if not connect.search(config.group_search_base, f"(uniqueMember={u_dn})"):
+        if connect.last_error:
+            raise click.ClickException(f"Failed to query groups: {connect.result}")
+
+
+    for r in connect.entries:
+        _print_entry(r, [], separator='\n')
+
 
 @cli.group()
 @click.pass_context
@@ -480,7 +498,7 @@ def group_display(ctx, group_name, attribute):
 
         if results:
             for r in connect.entries:
-                _print_entry(r, attribute)
+                _print_entry(r, attribute, separator=GROUP_SPACING)
         else:
             raise click.ClickException("Failed to retrieve groups")
 
