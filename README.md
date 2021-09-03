@@ -46,6 +46,7 @@ are available:
 | group   | | Manage a user's groups
 | group   | add | Add a user to a group |
 | group   | remove | Remove a user from group |
+| group   | display | Display user's groups |
 
 ## Groups
 LDAPCli can manage groups and group membership via the 
