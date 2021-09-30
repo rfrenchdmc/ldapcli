@@ -5,6 +5,9 @@ import ldap3
 import yaml
 import os
 import os.path
+from tabulate import tabulate
+from copy import copy
+
 try:
     from yaml import CLoader as Loader, CDumper as Dumper
 except ImportError:
@@ -46,7 +49,11 @@ _verbosity = 1
 
 LATEST_CONFIG_VERSION = '1.0'
 
-GROUP_SPACING='\n\t            '
+GROUP_SPACING = '\n\t              '
+
+GROUP_ID_FIELD = 'cn'
+USER_ID_FIELD = 'uid'
+
 
 class LdapConfig:
 
@@ -120,20 +127,29 @@ class LdapConfig:
         self.profiles[self.current_profile_name] = current_values
 
 
-def _normalize_names(nm, base):
-    if nm.startswith("cn="):
+def __normalize_names(nm, base, id_field):
+    if nm.startswith(f"{id_field}="):
         dn = nm
-        name = nm[3:nm.index(',')]
+        name = nm[len(id_field) + 1:nm.index(',')]
     else:
         name = nm
-        dn = f"cn={nm},{base}"
+        dn = f"{id_field}={nm},{base}"
 
     return name, dn
+
+
+def _normalize_user_names(nm, base):
+    return __normalize_names(nm, base, USER_ID_FIELD)
+
+
+def _normalize_group_names(nm, base):
+    return __normalize_names(nm, base, GROUP_ID_FIELD)
 
 
 def _print_entry(entry, attributes, show_empty=True, separator=','):
     print(entry.entry_dn)
     for a in attributes:
+
         v = entry.entry_attributes_as_dict[a]
 
         if v or show_empty:
@@ -189,8 +205,11 @@ def _connect_ldap(ctx):
 
 
 def _add_user_to_groups(config, connect, user_dn, groups):
+    if isinstance(groups, str):
+        groups = [groups]
+
     for g in groups:
-        g_name, g_dn = _normalize_names(g, config.group_search_base)
+        g_name, g_dn = _normalize_group_names(g, config.group_search_base)
 
         log(DEBUG, f"Adding {user_dn} to group {g_dn}")
         if not connect.modify(g_dn, {'uniqueMember': [(ldap3.MODIFY_ADD, [user_dn])]}):
@@ -199,31 +218,55 @@ def _add_user_to_groups(config, connect, user_dn, groups):
 
 def _remove_user_from_groups(config, connect, user_dn, groups):
     for g in groups:
-        g_name, g_dn = _normalize_names(g, config.group_search_base)
+        g_name, g_dn = _normalize_group_names(g, config.group_search_base)
         log(DEBUG, f"Removing {user_dn} from group {g_dn}")
         if not connect.modify(g_dn, {'uniqueMember': [(ldap3.MODIFY_DELETE, [user_dn])]}):
             raise click.ClickException(f"Failed to remove user to group {g}: {connect.result}")
 
 
-def _verify_entity_exists(ctx, entity, base):
+def _verify_entity_exists(ctx, entity, base, id_field):
     connect = ctx.obj[CTX_CONNECT]
-    cn, dn = _normalize_names(entity, base)
+    uid, dn = __normalize_names(entity, base, id_field)
 
-    if not connect.search(base, f"(cn={cn})"):
+    if not connect.search(base, f"({id_field}={uid})"):
         if connect.last_error:
             raise click.ClickException(f"Failed to find entity {connect.result}")
 
-    return cn, dn
+    return uid, dn
 
 
 def _verify_user_exists(ctx, user_dn):
     conf = ctx.obj[CTX_CONFIG]
-    return _verify_entity_exists(ctx, user_dn, conf.user_search_base)
+    return _verify_entity_exists(ctx, user_dn, conf.user_search_base, USER_ID_FIELD)
 
 
-def _verify_group_exists(ctx, group):
+def _verify_group_exists(ctx, grp):
     conf = ctx.obj[CTX_CONFIG]
-    return _verify_entity_exists(ctx, group, conf.group_search_base)
+    return _verify_entity_exists(ctx, grp, conf.group_search_base, GROUP_ID_FIELD)
+
+
+def _create_group(ctx, group_name, group_id, description=None):
+    ctx.ensure_object(dict)
+    obj = ctx.obj
+    conf = obj[CTX_CONFIG]
+
+    group_name, group_dn = _normalize_group_names(group_name, conf.group_search_base)
+
+    log(DEBUG, f"Adding Group name={group_name} dn={group_dn}")
+
+    args = {
+        GROUP_ID_FIELD: group_name
+    }
+
+    cls = ['top', 'groupOfUniqueNames', 'posixGroup']
+
+    args['gidNumber'] = group_id
+
+    if description:
+        args['description'] = description
+
+    connect = obj[CTX_CONNECT]
+    connect.add(group_dn, cls, args)
 
 
 @click.group()
@@ -241,7 +284,7 @@ def cli(ctx, config_file, profile_name, verbose):
     ctx.obj[CTX_CONFIG] = LdapConfig.load(config_file, profile_name)
 
 
-@cli.resultcallback()
+@cli.result_callback()
 @click.pass_context
 def user_cleanup(ctx, result, **kwargs):
     if CTX_CONNECT in ctx.obj:
@@ -256,14 +299,14 @@ def user(ctx):
 
 
 @user.command(name='create')
-@click.option("--username", "-u", help="login name for user", required=True)
-@click.option("--commonname", "-c", help="Common name for user")
+@click.option("--username", "-u", help="login name for user", required=True, prompt=True)
+@click.option("--commonname", "-c", help="Common name for user", required=True, prompt=True)
 @click.option("--public-key", "-p", help="Public key for user")
 @click.option("--uid", help="Specify user id")
 @click.option("--home", help="Specify user's home directory")
 @click.option("--gid", help="Specify group id")
-@click.option("--surname", help="Specify user's surname", required=True)
-@click.option("--email", help="Specify user's email", required=True)
+@click.option("--surname", help="Specify user's surname", required=True, prompt=True)
+@click.option("--email", help="Specify user's email", required=True, prompt=True)
 @click.option("--group", '-g', multiple=True, default=[], help="group to add users")
 @click.pass_context
 def user_create(ctx, username, commonname, public_key, uid, gid, home, surname, email, group):
@@ -284,8 +327,13 @@ def user_create(ctx, username, commonname, public_key, uid, gid, home, surname, 
         max_gid = 100
 
         for r in connect.entries:
-            max_uid = max(max_uid, int(r.uid.value))
-            max_gid = max(max_gid, int(r.gidNumber.value))
+            max_uid = max(max_uid, r.entry_attributes_as_dict.get('uidNumber', [0])[0])
+            tgid = r.entry_attributes_as_dict.get('gidNumber', [0])
+            if tgid == []:
+                tgid = 0
+            else:
+                tgid = tgid[0]
+            max_gid = max(max_gid, tgid)
 
         next_id = max(max_uid, max_gid) + 1
 
@@ -295,29 +343,36 @@ def user_create(ctx, username, commonname, public_key, uid, gid, home, surname, 
 
         if connect.entries:
             raise click.ClickException(f"Entry with uid {uid} already exists")
+    else:
+        uid = next_id
 
     if gid:
-        if not connect.search(conf.user_search_base, f"(gid={gid})"):
+        if not connect.search(conf.user_search_base, f"(gidNumber={gid})"):
             raise click.ClickException(f"Failed to query for gid: {connect.result}")
 
         if connect.entries:
             raise click.ClickException(f"Entry with gid {gid} already exists")
+    else:
+        gid = next_id
 
     if not home:
         home = f"/home/{username}"
 
-    username, user_dn = _normalize_names(username, conf.user_search_base)
+    username, user_dn = _normalize_user_names(username, conf.user_search_base)
+
+    log(DEBUG, f"Creating group: {username} id: {gid}")
+    _create_group(ctx, username, gid)
 
     log(DEBUG, f"Adding user name: {username} dn: {user_dn}")
 
     args = {
-        'cn': commonname or username,
-        'uid': next_id,
+        'uid': username,
         'uidNumber': next_id,
         'homeDirectory': home,
         'gidNumber': next_id,
         'sn': surname,
         'mail': email,
+        'cn': commonname
     }
 
     if public_key:
@@ -349,17 +404,19 @@ def user_passwd(ctx, username):
         raise click.ClickException(f"Failed to change password for {user_dn}")
 
 
-@user.command(name='remove')
-@click.option("--username", '-u', required=True, help="Username to remove")
+@user.command(name='public-key')
+@click.option("--public-key", '-p', required=True)
+@click.option("--username", '-u', required=True, help="Username to update")
 @click.pass_context
-def user_remove(ctx, username):
+def user_public_key(ctx, username, public_key):
     obj = ctx.obj
-    conf = obj[CTX_CONFIG]
-    u_name, u_dn = _normalize_names(username, conf.user_search_base)
+    u_name, u_dn = _verify_user_exists(ctx, username)
 
-    log(DEBUG, f"Removing user {u_dn}")
-    if not obj[CTX_CONNECT].delete(u_dn):
-        raise click.ClickException(f"Failed to delete user {u_dn}")
+    pk = _retrieve_value(public_key).encode('utf-8')
+
+    connect = obj[CTX_CONNECT]
+    if not connect.modify(u_dn, dict(sshPublicKey=[(ldap3.MODIFY_REPLACE, pk)])):
+        raise click.ClickException(f"Failed to change public key for {u_dn}")
 
 
 @user.command(name='display')
@@ -372,8 +429,8 @@ def user_display(ctx, username, attribute, show_empty):
     config = ctx.obj[CTX_CONFIG]
 
     if username:
-        u_name, u_dn = _normalize_names(username, config.user_search_base)
-        result = connect.search(config.user_search_base, f'(cn={u_name})', attributes=attribute)
+        u_name, u_dn = _normalize_user_names(username, config.user_search_base)
+        result = connect.search(config.user_search_base, f'(uid={u_name})', attributes=attribute)
 
     else:
         result = connect.search(config.user_search_base, '(objectclass=person)', attributes=attribute)
@@ -381,6 +438,28 @@ def user_display(ctx, username, attribute, show_empty):
     if result:
         for r in connect.entries:
             _print_entry(r, attribute, show_empty)
+
+
+@user.command(name='list')
+@click.option("--attribute", '-a', multiple=True, default=['dn'])
+@click.pass_context
+def user_list(ctx, attribute):
+    connect = ctx.obj['connect']
+    config = ctx.obj[CTX_CONFIG]
+
+    attribute = [x.lower() for x in attribute]
+    result = connect.search(config.user_search_base, '(objectclass=person)', attributes=attribute)
+
+    table = []
+    if result:
+        for r in connect.entries:
+            d = r.entry_attributes_as_dict
+            d['dn'] = r.entry_dn
+
+            t = [d.get(x) for x in attribute]
+            table.append(t)
+
+        print(tabulate(table, headers=attribute))
 
 
 @user.group(name='group')
@@ -413,6 +492,7 @@ def user_group_add(ctx, username, group):
 
     _remove_user_from_groups(config, connect, u_dn, group)
 
+
 @user_group.command(name='display')
 @click.option("--username", '-u', required=True, help="User to remove")
 @click.pass_context
@@ -426,7 +506,6 @@ def user_group_display(ctx, username):
         if connect.last_error:
             raise click.ClickException(f"Failed to query groups: {connect.result}")
 
-
     for r in connect.entries:
         _print_entry(r, [], separator='\n')
 
@@ -435,6 +514,58 @@ def user_group_display(ctx, username):
 @click.pass_context
 def group(ctx):
     _connect_ldap(ctx)
+
+
+@group.command()
+@click.pass_context
+def fix_groups(ctx):
+    connect = ctx.obj['connect']
+    config = ctx.obj[CTX_CONFIG]
+
+    result = connect.search(config.user_search_base, '(objectclass=person)',
+                            attributes=['uidNumber', 'gidNumber', 'cn', 'uid'])
+
+    people = {}
+
+    for e in connect.entries:
+        if e.uid.value:
+            people[e.uid.value] = dict(dict(uid=e.uidNumber.value,
+                                           dn=e.entry_dn,
+                                           gid=e.gidNumber.value))
+
+    groups = {}
+
+    connect.search(config.group_search_base, '(objectclass=groupOfUniqueNames)',
+                   attributes=['gidNumber', 'uniqueMember', 'cn', 'objectClass'])
+
+    for e in connect.entries:
+        groups[e.cn.value] = dict(gid=e.gidNumber.value, dn=e.entry_dn, members=e.uniqueMember.values,
+                                  object_class=e.objectClass.values)
+
+    for g, v in groups.items():
+
+        # find user with same cn
+        p = people.get(g)
+
+        if p is not None:
+            updates = {}
+
+            # found a person
+            if 'posixGroup' not in v['object_class']:
+                #add object class
+                updates['objectClass'] = [(ldap3.MODIFY_ADD, ['posixGroup'])]
+
+            if v['gid'] is None:
+                #no gid, update
+                updates['gidNumber'] = [(ldap3.MODIFY_REPLACE, [p['gid']])]
+
+            if p['dn'] not in v['members']:
+                #not a member, add
+                updates['uniqueMember'] = [(ldap3.MODIFY_ADD, [p['dn']])]
+
+            if updates:
+                if not connect.modify(v['dn'], updates):
+                    raise click.ClickException(f"Failed up update group {g}: {connect.result}")
 
 
 def _convert_values_bytes(d):
@@ -452,29 +583,34 @@ def _convert_values_bytes(d):
     return results
 
 
+@group.command(name='list')
+@click.option("--attribute", '-a', multiple=True, default=['dn'])
+@click.pass_context
+def group_list(ctx, attribute):
+    connect = ctx.obj['connect']
+    config = ctx.obj[CTX_CONFIG]
+
+    attribute = [x.lower() for x in attribute]
+    result = connect.search(config.group_search_base, '(objectclass=groupofuniquenames)', attributes=attribute)
+
+    table = []
+    if result:
+        for r in connect.entries:
+            d = r.entry_attributes_as_dict
+            d['dn'] = r.entry_dn
+
+            t = [d.get(x) for x in attribute]
+            table.append(t)
+
+        print(tabulate(table, headers=attribute))
+
+
 @group.command(name="create")
 @click.option("--group-name", "-g", required=True, help='Name of group')
 @click.option("--description", "-d", default="", help='Description of group')
 @click.pass_context
 def group_create(ctx, group_name, description):
-    ctx.ensure_object(dict)
-    obj = ctx.obj
-    conf = obj[CTX_CONFIG]
-
-    group_name, group_dn = _normalize_names(group_name, conf.group_search_base)
-
-    log(DEBUG, f"Adding Group name={group_name} dn={group_dn}")
-
-    args = {
-        'cn': group_name
-    }
-
-    if description:
-        args['description'] = description
-
-    cls = ['top', 'groupOfUniqueNames']
-    connect = obj[CTX_CONNECT]
-    connect.add(group_dn, cls, args)
+    _create_group(ctx, group_name, description)
 
 
 @group.command(name='display')
@@ -485,35 +621,39 @@ def group_display(ctx, group_name, attribute):
     connect = ctx.obj[CTX_CONNECT]
     config = ctx.obj[CTX_CONFIG]
 
+    attribute = list(attribute)
+
+    filter = "(objectclass=groupOfUniqueNames)"
     if group_name:
-        pass
+        filter = f"(&{filter}(cn={group_name}))"
+
+    g_dn = config.group_search_base
+    log(DEBUG, f"Searching groups in {g_dn}")
+    log(DEBUG, f"Searching groups filter {filter}")
+
+    if 'uniqueMember' not in attribute:
+        attribute.append('uniqueMember')
+
+    results = connect.search(g_dn, filter, attributes=attribute)
+
+    if results:
+        for r in connect.entries:
+            _print_entry(r, attribute, separator=GROUP_SPACING)
     else:
-        g_dn = config.group_search_base
-        log(DEBUG, f"Searching groups in {g_dn}")
-
-        if 'uniqueMember' not in attribute:
-            attribute.append('uniqueMember')
-
-        results = connect.search(g_dn, "(objectclass=groupOfUniqueNames)", attributes=attribute)
-
-        if results:
-            for r in connect.entries:
-                _print_entry(r, attribute, separator=GROUP_SPACING)
-        else:
-            raise click.ClickException("Failed to retrieve groups")
+        raise click.ClickException("Failed to retrieve groups")
 
 
 @group.command(name='remove')
 @click.option("--group", "-g", help='Name of group', required=True)
 @click.pass_context
-def group_remove(ctx, group_name):
+def group_remove(ctx, group):
     ctx.ensure_object(dict)
     obj = ctx.obj
     conf = obj[CTX_CONFIG]
 
-    group_name, group_dn = _normalize_names(group_name, conf.group_search_base)
+    group_name, group_dn = _normalize_group_names(group, conf.group_search_base)
 
-    log(DEBUG, f"Removing Group dn={group_dn}")
+    log(DEBUG, f"Removing Group {group_dn}")
     obj[CTX_CONNECT].delete(group_dn)
 
 
@@ -532,9 +672,9 @@ def group_user_add(ctx, group, user):
     conf = obj[CTX_CONFIG]
     connect = obj[CTX_CONNECT]
 
-    cn, dn = _verify_group_exists(ctx, group)
+    id, dn = _verify_group_exists(ctx, group)
 
-    if not connect.search(conf.group_search_base, f'(cn={cn})', attributes=['uniqueMember']):
+    if not connect.search(conf.group_search_base, f'({GROUP_ID_FIELD}={id})', attributes=['uniqueMember']):
         raise click.ClickException(f"Failed to query group {dn}: {connect.result}")
 
     current_members = set([x for x in connect.entries[0].uniqueMember.value])
@@ -542,7 +682,7 @@ def group_user_add(ctx, group, user):
     new_members = []
 
     for u in user:
-        u_cn, u_dn = _normalize_names(u, conf.user_search_base)
+        id, u_dn = _normalize_user_names(u, conf.user_search_base)
 
         if u_dn not in current_members:
             new_members.append((ldap3.MODIFY_ADD, u_dn))
@@ -562,15 +702,16 @@ def group_user_remove(ctx, group, user):
     conf = obj[CTX_CONFIG]
     connect = obj[CTX_CONNECT]
 
-    cn, dn = _verify_group_exists(ctx, group)
+    id, dn = _verify_group_exists(ctx, group)
 
     args = []
     for u in user:
-        u_cn, u_dn = _normalize_names(u, conf.user_search_base)
+        u_id, u_dn = _normalize_user_names(u, conf.user_search_base)
         args.append((ldap3.MODIFY_DELETE, u_dn))
 
     if not connect.modify(dn, {'uniqueMember': args}):
         raise click.ClickException(f"Failed to remove users from group {dn}")
+
 
 @cli.group()
 def profile():
@@ -654,6 +795,7 @@ def profile_remove(ctx):
     log(DEBUG, f"Removing profile {conf.current_profile_name}")
     conf.profiles.pop(conf.current_profile_name)
     conf.write(ctx.obj[CTX_CONFIG_FILE])
+
 
 if __name__ == '__main__':
     cli()
