@@ -1,4 +1,4 @@
 pyaml
 ldap3
 click
-tabulateZZ
+tabulate
