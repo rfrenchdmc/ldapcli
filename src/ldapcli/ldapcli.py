@@ -7,6 +7,7 @@ import os
 import os.path
 from tabulate import tabulate
 from copy import copy
+import logging
 
 try:
     from yaml import CLoader as Loader, CDumper as Dumper
@@ -14,10 +15,12 @@ except ImportError:
     from yaml import Loader, Dumper
 
 # pasword field = userPassowrd
-ERROR = 0
-INFO = 1
-DEBUG = 2
-TRACE = 3
+LOG_LEVELS = {
+    0: logging.ERROR,
+    1: logging.WARNING,
+    2: logging.INFO,
+    3: logging.DEBUG,
+}
 
 CONFIG_VERSION = 'version'
 CONFIG_PROFILES = 'profiles'
@@ -54,6 +57,7 @@ GROUP_SPACING = '\n\t              '
 GROUP_ID_FIELD = 'cn'
 USER_ID_FIELD = 'uid'
 
+_logger = logging.getLogger('ldapcli')
 
 class LdapConfig:
 
@@ -160,11 +164,7 @@ def set_verbosity(v):
     global _verbosity
     _verbosity = v
 
-
-def log(level, msg):
-    if _verbosity >= level:
-        print(msg)
-
+    _logger.setLevel(LOG_LEVELS.get(_verbosity, logging.INFO))
 
 class InvalidEntry(Exception):
     def __init__(self, msg):
@@ -194,7 +194,7 @@ def _connect_ldap(ctx):
     host = config.host_url
     dn = config.bind_dn
 
-    log(DEBUG, f"Connecting to {host} with {dn}")
+    _logger.debug(f"Connecting to {host} with {dn}")
     s = ldap3.Server(host)
     c = ldap3.Connection(s, user=dn, password=passwd)
 
@@ -204,22 +204,29 @@ def _connect_ldap(ctx):
     ctx.obj[CTX_CONNECT] = c
 
 
-def _add_user_to_groups(config, connect, user_dn, groups):
+def _add_user_to_groups(config, connect, user_dn, user_id, groups):
     if isinstance(groups, str):
         groups = [groups]
 
     for g in groups:
         g_name, g_dn = _normalize_group_names(g, config.group_search_base)
 
-        log(DEBUG, f"Adding {user_dn} to group {g_dn}")
-        if not connect.modify(g_dn, {'uniqueMember': [(ldap3.MODIFY_ADD, [user_dn])]}):
+        _logger.debug(f"Adding uniqueMember={user_dn} to group {g_dn}")
+        _logger.debug(f"Adding memberUid={user_id} to group {g_dn}")
+
+        mods = {
+            'uniqueMember': [(ldap3.MODIFY_ADD, [user_dn])],
+            'memberUid': [(ldap3.MODIFY_ADD, [user_id])]
+        }
+
+        if not connect.modify(g_dn, mods):
             raise click.ClickException(f"Failed to add user to group {g}: {connect.result}")
 
 
 def _remove_user_from_groups(config, connect, user_dn, groups):
     for g in groups:
         g_name, g_dn = _normalize_group_names(g, config.group_search_base)
-        log(DEBUG, f"Removing {user_dn} from group {g_dn}")
+        _logger.debug( f"Removing {user_dn} from group {g_dn}")
         if not connect.modify(g_dn, {'uniqueMember': [(ldap3.MODIFY_DELETE, [user_dn])]}):
             raise click.ClickException(f"Failed to remove user to group {g}: {connect.result}")
 
@@ -252,7 +259,7 @@ def _create_group(ctx, group_name, group_id, description=None):
 
     group_name, group_dn = _normalize_group_names(group_name, conf.group_search_base)
 
-    log(DEBUG, f"Adding Group name={group_name} dn={group_dn}")
+    _logger.debug(f"Adding Group name={group_name} dn={group_dn}")
 
     args = {
         GROUP_ID_FIELD: group_name
@@ -268,6 +275,7 @@ def _create_group(ctx, group_name, group_id, description=None):
     connect = obj[CTX_CONNECT]
     connect.add(group_dn, cls, args)
 
+    return group_name, group_dn
 
 @click.group()
 @click.option("--config-file", "-c", default=os.path.join(os.getenv("HOME"), ".ldapcli.yml"))
@@ -278,7 +286,7 @@ def cli(ctx, config_file, profile_name, verbose):
     ctx.ensure_object(dict)
     set_verbosity(verbose)
 
-    log(DEBUG, f"Loading profile {profile_name} from {config_file}")
+    _logger.debug(f"Loading profile {profile_name} from {config_file}")
 
     ctx.obj[CTX_CONFIG_FILE] = config_file
     ctx.obj[CTX_CONFIG] = LdapConfig.load(config_file, profile_name)
@@ -288,7 +296,7 @@ def cli(ctx, config_file, profile_name, verbose):
 @click.pass_context
 def user_cleanup(ctx, result, **kwargs):
     if CTX_CONNECT in ctx.obj:
-        log(DEBUG, "Closing connection")
+        _logger.debug("Closing connection")
         ctx.obj[CTX_CONNECT].unbind()
 
 
@@ -337,6 +345,8 @@ def user_create(ctx, username, commonname, public_key, uid, gid, home, surname, 
 
         next_id = max(max_uid, max_gid) + 1
 
+        _logger.debug(f"Next id: {next_id}")
+
     if uid:
         if not connect.search(conf.user_search_base, f"(uid={uid})"):
             raise click.ClickException(f"Failed to query for uid: {connect.result}")
@@ -360,10 +370,11 @@ def user_create(ctx, username, commonname, public_key, uid, gid, home, surname, 
 
     username, user_dn = _normalize_user_names(username, conf.user_search_base)
 
-    log(DEBUG, f"Creating group: {username} id: {gid}")
-    _create_group(ctx, username, gid)
+    _logger.debug(f"Creating group: {username} id: {gid}")
+    group_name, group_dn = _create_group(ctx, username, gid)
+    _add_user_to_groups(conf, connect, user_dn, username, group_name)
 
-    log(DEBUG, f"Adding user name: {username} dn: {user_dn}")
+    _logger.debug(f"Adding user name: {username} dn: {user_dn}")
 
     args = {
         'uid': username,
@@ -384,7 +395,7 @@ def user_create(ctx, username, commonname, public_key, uid, gid, home, surname, 
     if not connect.add(user_dn, cls, args):
         raise click.ClickException(f"Failed to create user {user_dn}: {connect.result}")
 
-    _add_user_to_groups(conf, connect, user_dn, group)
+    _add_user_to_groups(conf, connect, user_dn, username, group)
 
 
 @user.command(name='passwd')
@@ -399,7 +410,7 @@ def user_passwd(ctx, username):
 
     passwd = click.prompt("New Password", confirmation_prompt=True, hide_input=True)
 
-    log(DEBUG, f"Resetting password for {user_dn}")
+    _logger.debug(f"Resetting password for {user_dn}")
     if not connect.modify(user_dn, dict(userPassword=[(ldap3.MODIFY_REPLACE, passwd)])):
         raise click.ClickException(f"Failed to change password for {user_dn}")
 
@@ -522,51 +533,31 @@ def fix_groups(ctx):
     connect = ctx.obj['connect']
     config = ctx.obj[CTX_CONFIG]
 
-    result = connect.search(config.user_search_base, '(objectclass=person)',
-                            attributes=['uidNumber', 'gidNumber', 'cn', 'uid'])
+    result = connect.search(config.group_search_base, '(objectclass=groupOfUniqueNames)',
+                            attributes=['uniqueMember', 'memberUid', 'objectClass', 'gidNumber'])
 
-    people = {}
 
-    for e in connect.entries:
-        if e.uid.value:
-            people[e.uid.value] = dict(dict(uid=e.uidNumber.value,
-                                           dn=e.entry_dn,
-                                           gid=e.gidNumber.value))
-
-    groups = {}
-
-    connect.search(config.group_search_base, '(objectclass=groupOfUniqueNames)',
-                   attributes=['gidNumber', 'uniqueMember', 'cn', 'objectClass'])
+    next_gid = 20000
 
     for e in connect.entries:
-        groups[e.cn.value] = dict(gid=e.gidNumber.value, dn=e.entry_dn, members=e.uniqueMember.values,
-                                  object_class=e.objectClass.values)
+        mods = {}
 
-    for g, v in groups.items():
+        if 'posixGroup' not in e.objectClass.values:
+            mods['objectClass'] = [(ldap3.MODIFY_ADD, ['posixGroup'])]
+            if not e.gidNumber:
+                mods['gidNumber']  = [(ldap3.MODIFY_ADD, [next_gid])]
+                next_gid += 1
 
-        # find user with same cn
-        p = people.get(g)
+        for g in e.uniqueMember.values:
+            if g != 'cn=Directory Manager':
+                uid, udn = _normalize_user_names(g, config.user_search_base)
 
-        if p is not None:
-            updates = {}
+                if uid not in e.memberUid.values:
+                    mods.setdefault('memberUid', []).append((ldap3.MODIFY_ADD, [uid]))
 
-            # found a person
-            if 'posixGroup' not in v['object_class']:
-                #add object class
-                updates['objectClass'] = [(ldap3.MODIFY_ADD, ['posixGroup'])]
-
-            if v['gid'] is None:
-                #no gid, update
-                updates['gidNumber'] = [(ldap3.MODIFY_REPLACE, [p['gid']])]
-
-            if p['dn'] not in v['members']:
-                #not a member, add
-                updates['uniqueMember'] = [(ldap3.MODIFY_ADD, [p['dn']])]
-
-            if updates:
-                if not connect.modify(v['dn'], updates):
-                    raise click.ClickException(f"Failed up update group {g}: {connect.result}")
-
+        if mods:
+            if not connect.modify(e.entry_dn, mods):
+                raise click.ClickException(f"Failed up update group {g}: {connect.result}")
 
 def _convert_values_bytes(d):
     results = {}
@@ -623,13 +614,13 @@ def group_display(ctx, group_name, attribute):
 
     attribute = list(attribute)
 
-    filter = "(objectclass=groupOfUniqueNames)"
+    filter = "(objectclass=posixGroup)"
     if group_name:
         filter = f"(&{filter}(cn={group_name}))"
 
     g_dn = config.group_search_base
-    log(DEBUG, f"Searching groups in {g_dn}")
-    log(DEBUG, f"Searching groups filter {filter}")
+    _logger.debug(f"Searching groups in {g_dn}")
+    _logger.debug(f"Searching groups filter {filter}")
 
     if 'uniqueMember' not in attribute:
         attribute.append('uniqueMember')
@@ -653,7 +644,7 @@ def group_remove(ctx, group):
 
     group_name, group_dn = _normalize_group_names(group, conf.group_search_base)
 
-    log(DEBUG, f"Removing Group {group_dn}")
+    _logger.debug(f"Removing Group {group_dn}")
     obj[CTX_CONNECT].delete(group_dn)
 
 
@@ -674,21 +665,21 @@ def group_user_add(ctx, group, user):
 
     id, dn = _verify_group_exists(ctx, group)
 
-    if not connect.search(conf.group_search_base, f'({GROUP_ID_FIELD}={id})', attributes=['uniqueMember']):
+    if not connect.search(conf.group_search_base, f'({GROUP_ID_FIELD}={id})', attributes=['uniqueId']):
         raise click.ClickException(f"Failed to query group {dn}: {connect.result}")
 
-    current_members = set([x for x in connect.entries[0].uniqueMember.value])
+    current_members = set(connect.entries[0].uniqueId.values)
 
     new_members = []
 
     for u in user:
         id, u_dn = _normalize_user_names(u, conf.user_search_base)
 
-        if u_dn not in current_members:
-            new_members.append((ldap3.MODIFY_ADD, u_dn))
+        if id not in current_members:
+            new_members.append((ldap3.MODIFY_ADD, id))
 
     if new_members:
-        if not connect.modify(dn, {'uniqueMember': new_members}):
+        if not connect.modify(dn, {'uniqueUid': new_members}):
             raise click.ClickException("Failed to add users to group")
 
 
@@ -792,7 +783,7 @@ def profile_update(ctx, host_url, bind_dn, group_search_dn, user_search_dn,
 def profile_remove(ctx):
     conf = ctx.obj[CTX_CONFIG]
 
-    log(DEBUG, f"Removing profile {conf.current_profile_name}")
+    _logger.debug(f"Removing profile {conf.current_profile_name}")
     conf.profiles.pop(conf.current_profile_name)
     conf.write(ctx.obj[CTX_CONFIG_FILE])
 
