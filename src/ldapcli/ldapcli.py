@@ -8,6 +8,8 @@ import os.path
 from tabulate import tabulate
 from copy import copy
 import logging
+import string
+import random
 
 try:
     from yaml import CLoader as Loader, CDumper as Dumper
@@ -58,6 +60,7 @@ GROUP_ID_FIELD = 'cn'
 USER_ID_FIELD = 'uid'
 
 _logger = logging.getLogger('ldapcli')
+
 
 class LdapConfig:
 
@@ -166,6 +169,7 @@ def set_verbosity(v):
 
     _logger.setLevel(LOG_LEVELS.get(_verbosity, logging.INFO))
 
+
 class InvalidEntry(Exception):
     def __init__(self, msg):
         super().__init__(msg)
@@ -226,7 +230,7 @@ def _add_user_to_groups(config, connect, user_dn, user_id, groups):
 def _remove_user_from_groups(config, connect, user_dn, groups):
     for g in groups:
         g_name, g_dn = _normalize_group_names(g, config.group_search_base)
-        _logger.debug( f"Removing {user_dn} from group {g_dn}")
+        _logger.debug(f"Removing {user_dn} from group {g_dn}")
         if not connect.modify(g_dn, {'uniqueMember': [(ldap3.MODIFY_DELETE, [user_dn])]}):
             raise click.ClickException(f"Failed to remove user to group {g}: {connect.result}")
 
@@ -277,6 +281,7 @@ def _create_group(ctx, group_name, group_id, description=None):
 
     return group_name, group_dn
 
+
 @click.group()
 @click.option("--config-file", "-c", default=os.path.join(os.getenv("HOME"), ".ldapcli.yml"))
 @click.option("--profile-name", "-n", default='default')
@@ -292,12 +297,55 @@ def cli(ctx, config_file, profile_name, verbose):
     ctx.obj[CTX_CONFIG] = LdapConfig.load(config_file, profile_name)
 
 
-@cli.result_callback()
+#@cli.result_callback
 @click.pass_context
 def user_cleanup(ctx, result, **kwargs):
     if CTX_CONNECT in ctx.obj:
         _logger.debug("Closing connection")
         ctx.obj[CTX_CONNECT].unbind()
+
+
+def _gen_password(length=24):
+    characters = list(string.ascii_letters + string.digits + "!@#$%^&*()")
+
+    ## shuffling the characters
+    random.shuffle(characters)
+
+    ## picking random characters from the list
+    password = []
+    for i in range(length):
+        password.append(random.choice(characters))
+
+    ## shuffling the resultant password
+    random.shuffle(password)
+
+    ## converting the list to string
+    return "".join(password)
+
+
+@cli.command()
+@click.pass_context
+def gen_minio(ctx):
+    _connect_ldap(ctx)
+    ctx.ensure_object(dict)
+    obj = ctx.obj
+    conf = obj[CTX_CONFIG]
+    connect = obj[CTX_CONNECT]
+
+    if not connect.search(conf.user_search_base, "(objectclass=person)", attributes=['uid']):
+        # Check if real error or just no records
+        if connect.last_error:
+            raise click.ClickException(f"Failed to query for uid: {connect.result}")
+
+    pwds = {}
+
+    for r in connect.entries:
+        d = r.entry_attributes_as_dict
+        uid = d['uid'][0]
+        pwds[uid] = _gen_password()
+
+    for x in sorted(pwds.keys()):
+        print(f"{x},{pwds[x]}")
 
 
 @cli.group()
@@ -488,7 +536,7 @@ def user_group_add(ctx, username, group):
 
     username, u_dn = _verify_user_exists(ctx, username)
 
-    _add_user_to_groups(config, connect, u_dn, group)
+    _add_user_to_groups(config, connect, username, u_dn, group)
 
 
 @user_group.command(name='remove')
@@ -536,7 +584,6 @@ def fix_groups(ctx):
     result = connect.search(config.group_search_base, '(objectclass=groupOfUniqueNames)',
                             attributes=['uniqueMember', 'memberUid', 'objectClass', 'gidNumber'])
 
-
     next_gid = 20000
 
     for e in connect.entries:
@@ -545,7 +592,7 @@ def fix_groups(ctx):
         if 'posixGroup' not in e.objectClass.values:
             mods['objectClass'] = [(ldap3.MODIFY_ADD, ['posixGroup'])]
             if not e.gidNumber:
-                mods['gidNumber']  = [(ldap3.MODIFY_ADD, [next_gid])]
+                mods['gidNumber'] = [(ldap3.MODIFY_ADD, [next_gid])]
                 next_gid += 1
 
         for g in e.uniqueMember.values:
@@ -558,6 +605,7 @@ def fix_groups(ctx):
         if mods:
             if not connect.modify(e.entry_dn, mods):
                 raise click.ClickException(f"Failed up update group {g}: {connect.result}")
+
 
 def _convert_values_bytes(d):
     results = {}
@@ -666,6 +714,7 @@ def group_user_add(ctx, group, user):
     id, dn = _verify_group_exists(ctx, group)
 
     if not connect.search(conf.group_search_base, f'({GROUP_ID_FIELD}={id})', attributes=['uniqueId']):
+    #if not connect.search(conf.group_search_base, f'({GROUP_ID_FIELD}={id})'):
         raise click.ClickException(f"Failed to query group {dn}: {connect.result}")
 
     current_members = set(connect.entries[0].uniqueId.values)
@@ -740,8 +789,6 @@ def prompt(txt, arg_value=None, current_value=None, required=False):
 @click.option("--bind-dn", '-b', help="Bind DN for the user to connect")
 @click.option("--user-search-dn", help='DN to search for users')
 @click.option("--group-search-dn", help='DN to search for groups')
-@click.option("--group-template", default="templates/group_template.ldif", help='LDIF template file to add Groups')
-@click.option("--user-template", default="templates/user_template.ldif", help='LDIF template file to add User')
 @click.pass_context
 def profile_add(ctx, host_url, bind_dn, group_search_dn, user_search_dn,
                 group_template, user_template):
